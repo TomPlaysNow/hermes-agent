@@ -13,7 +13,7 @@ the user through the clarify callback once per turn (nobody to ask = wait). None
 adds a switch: Nous plan limits (usage-window 402s) still never fall back on their own
 (``agent.plan_limits``).
 
-The notice rides the diagnostic status rail (``_buffer_diagnostic_status``), never the prompt.
+Both lines ride the diagnostic status rail, never the prompt.
 """
 
 from __future__ import annotations
@@ -221,7 +221,8 @@ def subscription_limit_holds(agent: Any, reason: FailoverReason | None, reset_at
             return False
     if getattr(agent, "_subscription_limit_noticed", None) != getattr(agent, "_user_turn_count", 0):
         agent._subscription_limit_noticed = getattr(agent, "_user_turn_count", 0)  # one line per turn, not per retry
-        agent._buffer_diagnostic_status(
+        # Emitted now, not buffered: a recovered primary clears the buffer, and the hold is the user's answer.
+        agent._emit_diagnostic_status(
             f"⏸️ {agent.model} via {agent.provider} limit reached{resets}. Not switching to {fb} (billed per token): "
             f"fallback.on_subscription_limit is {policy.value}.")
     logger.info("Subscription limit on %s: staying on the primary (fallback.on_subscription_limit=%s)", agent.model, policy.value)

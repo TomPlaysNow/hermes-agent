@@ -66,7 +66,7 @@ fallback:
   on_subscription_limit: ask   # switch (default) | wait | ask
 ```
 
-With `wait` or `ask` (answered "stay"), the turn stays on the primary and a `⏸️ … limit reached` line names the fallback it skipped. Custom endpoints, local servers and coding plans sold as API keys make no billing claim, so they always switch as before. A Nous Portal plan limit never falls back by itself: the limit card offers the alternatives.
+With `wait` or `ask` (answered "stay"), the turn stays on the primary and a `⏸️ … limit reached` line names the fallback it skipped. The normal retry backoff waits out a short window; a window longer than the retries cover ends the turn with the limit error, and the next turn tries the primary again. Custom endpoints, local servers and coding plans sold as API keys make no billing claim, so they always switch as before. A Nous Portal plan limit never falls back by itself: the limit card offers the alternatives.
 
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
