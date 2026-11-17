@@ -36,6 +36,7 @@ from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
+from agent.fallback_billing import RouteBilling, fallback_notice, live_route_billing, subscription_limit_holds
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 # Never fingerprint a remote endpoint: Ollama-compat routes misidentify and 401 without a key (#89863).
@@ -1758,40 +1759,6 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None if has_token else "nous_token_missing"
 
 
-_FALLBACK_REASON_LABELS = {
-    FailoverReason.auth: "authentication failed",
-    FailoverReason.auth_permanent: "authentication permanently failed",
-    FailoverReason.billing: "billing or quota exhausted",
-    FailoverReason.rate_limit: "rate limit",
-    FailoverReason.upstream_rate_limit: "upstream model rate limit",
-    FailoverReason.overloaded: "provider overloaded",
-    FailoverReason.server_error: "provider server error",
-    FailoverReason.timeout: "request timeout",
-    FailoverReason.ssl_cert_verification: "TLS certificate verification failed",
-    FailoverReason.context_overflow: "context window exceeded",
-    FailoverReason.payload_too_large: "request payload too large",
-    FailoverReason.image_too_large: "image payload too large",
-    FailoverReason.model_not_found: "model not found",
-    FailoverReason.provider_policy_blocked: "provider policy blocked the request",
-    FailoverReason.content_policy_blocked: "content policy blocked the request",
-    FailoverReason.format_error: "request format rejected",
-    FailoverReason.role_alternation: "adjacent same-role messages rejected",
-    FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
-    FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
-    FailoverReason.thinking_signature: "thinking signature rejected",
-    FailoverReason.long_context_tier: "long-context tier unavailable",
-    FailoverReason.oauth_long_context_beta_forbidden: "OAuth long-context beta unavailable",
-    FailoverReason.llama_cpp_grammar_pattern: "grammar pattern rejected",
-    FailoverReason.unknown: "provider failure",
-}
-
-
-def _fallback_reason_text(reason: FailoverReason | None) -> str:
-    """Return a concise operator-facing explanation for a fallback switch."""
-    label = _FALLBACK_REASON_LABELS.get(reason)
-    return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
-
-
 def _is_anthropic_wire_url(url: str) -> bool:
     """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
     a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
@@ -2035,9 +2002,10 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
-    from agent.fallback_cooldown import _arm_rate_limit_cooldown, fallback_consent_blocks, switch_deferred_by_reset
-    if switch_deferred_by_reset(agent, reason, reset_at) or fallback_consent_blocks(agent):
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    if switch_deferred_by_reset(agent, reason, reset_at) or subscription_limit_holds(agent, reason, reset_at):
         return False
+    left_subscription = not agent._fallback_activated and live_route_billing(agent) is RouteBilling.SUBSCRIPTION
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
@@ -2064,13 +2032,9 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             fb_model = agent.model  # normalized by the binder
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-            notice = (
-                f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-                f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
-            if cooldown_seconds is not None:
-                remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
-                notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
-            _buffer_fallback_notice(agent, notice)
+            _buffer_fallback_notice(agent, fallback_notice(
+                agent, reason, old_model, old_provider, cooldown_seconds=cooldown_seconds,
+                reset_at=reset_at, left_subscription=left_subscription))
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
