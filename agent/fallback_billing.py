@@ -26,12 +26,12 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from agent.anthropic_credentials import anthropic_route_is_oauth, native_anthropic_fallback_token
+from agent.anthropic_credentials import anthropic_route_is_oauth
 from agent.error_classifier import FailoverReason
 from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS, _provider_reset_delay
 from agent.model_metadata import is_local_endpoint
 from agent.usage_pricing import resolve_billing_route
-from hermes_cli.fallback_config import resolve_entry_api_key
+from agent.route_binding import RouteEntryClient, resolve_route_entry_client
 
 logger = logging.getLogger(__name__)
 
@@ -118,18 +118,6 @@ def live_route_billing(agent: Any) -> RouteBilling:
                          str(getattr(agent, "base_url", "") or ""), getattr(agent, "api_key", None))
 
 
-def _entry_billing(entry: dict) -> RouteBilling:
-    """The billing class a fallback entry would bind to, before binding it. An Anthropic entry
-    with no key of its own resolves the credential the binder would (OAuth seat or API key)."""
-    provider = str(entry.get("provider") or "").strip().lower()
-    model = str(entry.get("model") or "").strip()
-    base_url = str(entry.get("base_url") or "").strip()
-    key = resolve_entry_api_key(entry)
-    if provider == "anthropic" and not key:
-        key = native_anthropic_fallback_token(base_url, model=model)
-    return route_billing(provider, model, base_url, key)
-
-
 def configured_policy() -> SubscriptionLimitPolicy:
     from hermes_cli.config import load_config
     raw = str(((load_config() or {}).get("fallback") or {}).get("on_subscription_limit") or "switch").strip().lower()
@@ -193,32 +181,45 @@ def _ask_to_switch(agent: Any, question: str, go: str, stay: str) -> bool:
     return answer == go
 
 
-def subscription_limit_holds(agent: Any, reason: FailoverReason | None, reset_at: Any) -> bool:
-    """True = do NOT leave the primary. Only when the primary is a subscription that hit a limit
-    and the next fallback entry is metered, under ``wait``, or ``ask`` answered "stay" (asked once
-    per turn; no clarify callback = nobody to ask = stay). ``switch`` (default) never holds."""
-    if (reason not in _RATE_LIMIT_FAILOVER_REASONS or getattr(agent, "_fallback_activated", False)
-            or agent._fallback_index >= len(agent._fallback_chain)):
-        return False
+def limit_gate(agent: Any, reason: FailoverReason | None) -> Optional[SubscriptionLimitPolicy]:
+    """The policy every candidate of this fallback walk must pass, or None when nothing can hold:
+    ``switch`` (default), a non-limit failover, a walk off a fallback, or a non-subscription primary."""
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS or getattr(agent, "_fallback_activated", False):
+        return None
     policy = configured_policy()
     if policy is SubscriptionLimitPolicy.SWITCH or live_route_billing(agent) is not RouteBilling.SUBSCRIPTION:
-        return False
-    entry = agent._fallback_chain[agent._fallback_index]
-    if _entry_billing(entry) is not RouteBilling.METERED:
-        return False
+        return None
+    return policy
+
+
+def _consented(agent: Any, question: str, go: str, stay: str) -> bool:
+    """The turn's answer to the switch question: asked once per turn (the retry loop calls the walk
+    again); nobody to ask = stay."""
+    turn = getattr(agent, "_user_turn_count", 0)
+    cached = getattr(agent, "_subscription_limit_consent", None)
+    if not (isinstance(cached, tuple) and cached[0] == turn):
+        go_ahead = getattr(agent, "clarify_callback", None) is not None and _ask_to_switch(agent, question, go, stay)
+        cached = agent._subscription_limit_consent = (turn, go_ahead)
+    return cached[1]
+
+
+def hold_candidate(agent: Any, policy: SubscriptionLimitPolicy, entry: dict, provider: str, model: str,
+                   reset_at: Any) -> tuple[bool, Optional[RouteEntryClient]]:
+    """Resolve ``entry`` once and judge THAT client (its endpoint and the credential the pool picked):
+    ``(True, None)`` = it bills per token and ``policy`` says stay on the primary; otherwise
+    ``(False, route)`` with the route for the binder to reuse, so the bill judged is the bill bound."""
+    route = resolve_route_entry_client(entry, provider, model)
+    client = route.client
+    if client is None or route_billing(provider, route.model, str(getattr(client, "base_url", "") or ""),
+                                       getattr(client, "api_key", None)) is not RouteBilling.METERED:
+        return False, route
     clock = reset_clock(reset_at)
     resets = f" (resets {clock})" if clock else ""
-    fb = f"{entry.get('model', '?')} via {entry.get('provider', '?')}"
-    if policy is SubscriptionLimitPolicy.ASK:
-        turn = getattr(agent, "_user_turn_count", 0)
-        cached = getattr(agent, "_subscription_limit_consent", None)
-        if not (isinstance(cached, tuple) and cached[0] == turn):
-            go = _ask_to_switch(agent, f"{agent.model} hit its subscription limit{resets}. Continue on {fb}, billed per token?",
-                                f"Continue on {fb} (billed per token)", f"Stay on {agent.model}") \
-                if getattr(agent, "clarify_callback", None) is not None else False
-            cached = agent._subscription_limit_consent = (turn, go)
-        if cached[1]:
-            return False
+    fb = f"{route.model} via {provider}"
+    if policy is SubscriptionLimitPolicy.ASK and _consented(
+            agent, f"{agent.model} hit its subscription limit{resets}. Continue on {fb}, billed per token?",
+            f"Continue on {fb} (billed per token)", f"Stay on {agent.model}"):
+        return False, route
     if getattr(agent, "_subscription_limit_noticed", None) != getattr(agent, "_user_turn_count", 0):
         agent._subscription_limit_noticed = getattr(agent, "_user_turn_count", 0)  # one line per turn, not per retry
         # Emitted now, not buffered: a recovered primary clears the buffer, and the hold is the user's answer.
@@ -226,4 +227,4 @@ def subscription_limit_holds(agent: Any, reason: FailoverReason | None, reset_at
             f"⏸️ {agent.model} via {agent.provider} limit reached{resets}. Not switching to {fb} (billed per token): "
             f"fallback.on_subscription_limit is {policy.value}.")
     logger.info("Subscription limit on %s: staying on the primary (fallback.on_subscription_limit=%s)", agent.model, policy.value)
-    return True
+    return True, None

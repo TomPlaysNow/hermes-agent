@@ -36,7 +36,7 @@ from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
-from agent.fallback_billing import RouteBilling, fallback_notice, live_route_billing, subscription_limit_holds
+from agent.fallback_billing import RouteBilling, fallback_notice, hold_candidate, limit_gate, live_route_billing
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 # Never fingerprint a remote endpoint: Ollama-compat routes misidentify and 401 without a key (#89863).
@@ -2003,9 +2003,11 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
-    if switch_deferred_by_reset(agent, reason, reset_at) or subscription_limit_holds(agent, reason, reset_at):
+    if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     left_subscription = not agent._fallback_activated and live_route_billing(agent) is RouteBilling.SUBSCRIPTION
+    gate = limit_gate(agent, reason)  # opt-in fallback.on_subscription_limit; None = switch as always
+    walk_start = (agent._fallback_index, getattr(agent, "_rate_limited_until", 0), getattr(agent, "_rate_limit_backoff_count", 0))
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
@@ -2021,9 +2023,15 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
+        route = None
+        if gate is not None:
+            held, route = hold_candidate(agent, gate, fb, fb_provider, fb_model, reset_at)
+            if held:  # still on the primary: the next retry walks the chain from the same place
+                agent._fallback_index, agent._rate_limited_until, agent._rate_limit_backoff_count = walk_start
+                return False
         try:
             from agent.route_binding import bind_route_entry
-            bound = bind_route_entry(agent, fb, fb_provider, fb_model)
+            bound = bind_route_entry(agent, fb, fb_provider, fb_model, route=route)
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
